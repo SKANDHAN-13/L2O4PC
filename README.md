@@ -19,11 +19,11 @@ control problem with track-corridor safety constraints and solves it online usin
 2. [Repository Structure](#repository-structure)
 3. [Getting Started](#getting-started)
 4. [Component Reference](#component-reference)
-   - [mpc_config — Hyperparameter Dataclass](#mpc_config--hyperparameter-dataclass)
-   - [State — Vehicle State Dataclass](#state--vehicle-state-dataclass)
-   - [wrap_angle — Angle Utility](#wrap_angle--angle-utility)
-   - [calc_speed_profile — Adaptive Speed Planner](#calc_speed_profile--adaptive-speed-planner)
-   - [HeadlessMPC — Core MPC Controller](#headlessmpc--core-mpc-controller)
+   - [mpc_config - Hyperparameter Dataclass](#mpc_config--hyperparameter-dataclass)
+   - [State - Vehicle State Dataclass](#state--vehicle-state-dataclass)
+   - [wrap_angle - Angle Utility](#wrap_angle--angle-utility)
+   - [calc_speed_profile - Adaptive Speed Planner](#calc_speed_profile--adaptive-speed-planner)
+   - [HeadlessMPC - Core MPC Controller](#headlessmpc--core-mpc-controller)
      - [_load_waypoints](#_load_waypoints)
      - [_load_border_coeffs](#_load_border_coeffs)
      - [_linear_mpc_prob_init](#_linear_mpc_prob_init)
@@ -34,7 +34,7 @@ control problem with track-corridor safety constraints and solves it online usin
      - [_linear_mpc_prob_solve](#_linear_mpc_prob_solve)
      - [_linear_mpc_control](#_linear_mpc_control)
      - [update_yaw](#update_yaw)
-   - [GymMPCRunner — Simulation Harness](#gymmprunner--simulation-harness)
+   - [GymMPCRunner - Simulation Harness](#gymmprunner--simulation-harness)
 5. [Data Files](#data-files)
 6. [Notes](#NOTES)
 7. [Quick Example](#quick-example)
@@ -43,9 +43,6 @@ control problem with track-corridor safety constraints and solves it online usin
 
 ## Overview
 
-`mpc_gym_colab.py` implements a full **Model Predictive Control (MPC)** pipeline for
-the F1Tenth racing simulator.  All ROS dependencies have been stripped so it runs
-identically in a local terminal, a Colab notebook, or a headless CI environment.
 
 The pipeline follows a classical receding-horizon loop:
 
@@ -106,7 +103,7 @@ Outputs written to the working directory:
 
 ## Component Reference
 
-### `mpc_config` — Hyperparameter Dataclass
+### `mpc_config` - Hyperparameter Dataclass
 
 ```python
 @dataclass
@@ -116,9 +113,6 @@ class mpc_config:
     TK:  int = 10       # horizon steps (= 2 s at DTK=0.2 s)
     ...
 ```
-
-Central configuration object consumed by `HeadlessMPC`.  All tunable quantities
-live here so there is a single source of truth.
 
 | Parameter | Default | Role |
 |---|---|---|
@@ -138,7 +132,7 @@ live here so there is a single source of truth.
 
 ---
 
-### `State` — Vehicle State Dataclass
+### `State` - Vehicle State Dataclass
 
 ```python
 @dataclass
@@ -150,25 +144,24 @@ class State:
     yaw:   float = 0.0   # heading angle (rad)
 ```
 
-Lightweight mutable container passed through `update_state`, `_predict_motion`, and
+Mutable container passed through `update_state`, `_predict_motion`, and
 `calc_ref_trajectory`.
 
 ---
 
-### `wrap_angle` — Angle Utility
+### `wrap_angle` - Angle Utility
 
 ```python
 def wrap_angle(a):
     return np.arctan2(np.sin(a), np.cos(a))
 ```
 
-Maps any angle into `(−π, π]` using the two-argument arctangent.  Used throughout
-the yaw error computation inside `_linear_mpc_prob_solve` to prevent the solver
+Used throughout the yaw error computation inside `_linear_mpc_prob_solve` to prevent the solver
 from seeing artificially large heading errors across the ±π discontinuity.
 
 ---
 
-### `calc_speed_profile` — Adaptive Speed Planner
+### `calc_speed_profile` - Adaptive Speed Planner
 
 ```python
 sp = calc_speed_profile(cx, cy, cyaw)
@@ -178,9 +171,9 @@ Constructs a per-waypoint target speed array using three-zone logic:
 
 | Zone | Condition | Speed |
 |---|---|---|
-| **Straight** | `|Δyaw| ≤ CURVE_THRESHOLD` everywhere nearby | 5.0 m/s |
+| **Straight** | `abs(Δyaw) ≤ CURVE_THRESHOLD` everywhere nearby | 5.0 m/s |
 | **Entry boost** | Within `ENTRY_BOOST_COUNT` steps before a curve | 5.0 m/s |
-| **Curve** | `|Δyaw| > 0.01` | 2.5 m/s |
+| **Curve** | `abs(Δyaw) > 0.01` | 2.5 m/s |
 | **Exit ramp** | Within `EXIT_RAMP_COUNT` steps after a curve | linearly ramped 2.5 → 5.0 m/s |
 
 The resulting `sp` array is passed as reference speed `ref_traj[2, :]` to the MPC
@@ -188,11 +181,7 @@ solver and used as a fallback when IPOPT has not yet produced a valid solution.
 
 ---
 
-### `HeadlessMPC` — Core MPC Controller
-
-The main controller class.  Instantiated once before the simulation loop; its
-internal CasADi `Opti` problem is built once in `__init__` and then solved
-repeatedly by re-setting parameter values.
+### `HeadlessMPC` - Core MPC Controller
 
 ```python
 mpc = HeadlessMPC(
@@ -212,7 +201,7 @@ wp = self._load_waypoints("waypoints.csv")  # → np.ndarray (N, 3)
 Reads `x, y, yaw` columns from CSV, then:
 
 1. **Unwraps** the yaw column with `np.unwrap` to remove ±π jumps.
-2. **Closes the loop** — if the gap between the last and first point exceeds 5 cm,
+2. **Closes the loop** : If the gap between the last and first point exceeds 5 cm,
    linearly interpolates a bridge segment.
 3. **Resamples at 3 cm spacing** along cumulative arc-length so that every
    subsequent index calculation is uniform in distance.
@@ -234,20 +223,16 @@ Reads per-waypoint track boundary data from CSV columns
    `np.interp` on fractional indices.
 2. **Computes track wall XY** coordinates by offsetting the raceline along the
    normal vector `(a, b)` by `(c_left − c_center)` and `(c_right − c_center)`.
-3. **Computes corridor bounds** — scales each half-width by `CORRIDOR_FRACTION` to
+3. **Computes corridor bounds** : Scales each half-width by `CORRIDOR_FRACTION` to
    obtain tighter safety limits that feed the MPC constraints.
 
-Side effects: populates `self.border_walls_xy` and `self.border_corridor_xy` for
-GL visualisation.
-
-Return shape: `(N, 4)` — columns `[a, b, tight_cl, tight_cr]`.
+Return shape: `(N, 4)` - columns `[a, b, tight_cl, tight_cr]`.
 
 ---
 
 #### `_linear_mpc_prob_init`
 
-Builds the CasADi `Opti` problem **once** at construction time.  All matrices that
-change between solves are declared as `ca.Opti.parameter` so IPOPT can be
+All matrices that change between solves are declared as `ca.Opti.parameter` so IPOPT can be
 warm-started without rebuilding the symbolic graph.
 
 **Decision variables:**
@@ -346,11 +331,11 @@ ref_traj = mpc.calc_ref_trajectory(state, cx, cy, cyaw, sp)
 
 Computes the `(NX, TK+1)` reference trajectory from the global waypoint arrays:
 
-1. **Nearest-point search** — searches `N_IND_SEARCH` waypoints ahead of
+1. **Nearest-point search** - searches `N_IND_SEARCH` waypoints ahead of
    `target_ind` to find and advance the closest point.
-2. **Look-ahead spacing** — converts current speed to a step-size in waypoint
+2. **Look-ahead spacing** - converts current speed to a step-size in waypoint
    indices: `dind = v·DTK / dlk`.
-3. **Index list** — wraps around the closed loop using modular arithmetic so the
+3. **Index list** - wraps around the closed loop using modular arithmetic so the
    car races multiple laps without resetting.
 
 The index list is cached in `_last_ind_list` for use in the corridor constraint
@@ -369,11 +354,11 @@ Core solve call.  Sequence of operations per interval:
 1. **Build block-diagonal matrices** `A_bd`, `B_bd`, `C_bd` from per-step
    `_get_model_matrix` evaluations.
 2. **Set all Opti parameter values** (dynamics, corridor, reference).
-3. **Yaw continuity** — unwraps `ref_traj[3,:]` around `x0[3]` to prevent
+3. **Yaw continuity** - unwraps `ref_traj[3,:]` around `x0[3]` to prevent
    heading errors > π.
-4. **Warm start** — shifts the previous solution one step forward as the initial
+4. **Warm start** - shifts the previous solution one step forward as the initial
    guess via `opti.set_initial`.
-5. **Solve** — calls `opti.solve()`; on failure falls back to `opti.debug.value`
+5. **Solve** - calls `opti.solve()`; on failure falls back to `opti.debug.value`
    to extract the last iterate.
 6. Returns `oa` (acceleration sequence) and `odelta` (steering sequence).
 
@@ -397,8 +382,7 @@ yaw_continuous = mpc.update_yaw(yaw_raw)
 ```
 
 Maintains a running `yaw_offset` to unwrap the gym's wrapped `(−π, π]` yaw output
-into a monotonically-evolving heading angle.  Prevents the heading error in the QP
-from jumping by 2π across laps.
+into a monotonically-evolving heading angle.
 
 ---
 
