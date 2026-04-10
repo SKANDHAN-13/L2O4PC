@@ -351,16 +351,12 @@ oa, odelta = mpc._linear_mpc_prob_solve(ref_traj, path_predict, x0)
 
 Core solve call.  Sequence of operations per interval:
 
-1. **Build block-diagonal matrices** `A_bd`, `B_bd`, `C_bd` from per-step
-   `_get_model_matrix` evaluations.
-2. **Set all Opti parameter values** (dynamics, corridor, reference).
-3. **Yaw continuity** - unwraps `ref_traj[3,:]` around `x0[3]` to prevent
-   heading errors > π.
-4. **Warm start** - shifts the previous solution one step forward as the initial
+
+1. **Warm start** - shifts the previous solution one step forward as the initial
    guess via `opti.set_initial`.
-5. **Solve** - calls `opti.solve()`; on failure falls back to `opti.debug.value`
+2. **Solve** - calls `opti.solve()`; on failure falls back to `opti.debug.value`
    to extract the last iterate.
-6. Returns `oa` (acceleration sequence) and `odelta` (steering sequence).
+3. Returns `oa` (acceleration sequence) and `odelta` (steering sequence).
 
 ---
 
