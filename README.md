@@ -92,7 +92,6 @@ pip install f1tenth-gym casadi scipy imageio pillow
 ### Run
 
 ```bash
-cd examples
 python mpc_gym_colab.py
 ```
 
