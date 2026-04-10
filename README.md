@@ -440,8 +440,6 @@ Seven-column CSV with headers `w_tr_right, w_tr_left,a,b,c_center,c_left,c_right
 | `c_left` | Signed projection of the left wall onto the normal |
 | `c_right` | Signed projection of the right wall onto the normal |
 
-These are produced offline (e.g. by `random_trackgen.py`) and consumed by
-`_load_border_coeffs` to generate per-waypoint MPC corridor constraints.
 
 ---
 
