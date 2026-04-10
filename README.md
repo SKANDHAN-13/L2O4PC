@@ -1,5 +1,6 @@
 # MPC on F1Tenth Gym
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1RgHlU39CTojtIGw5r1O9V6uC9l_DRx5a?usp=sharing)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
 [![CasADi](https://img.shields.io/badge/Solver-CasADi%20%2F%20IPOPT-orange)](https://web.casadi.org/)
 [![F1Tenth Gym](https://img.shields.io/badge/Sim-F1Tenth%20Gym-red)](https://f1tenth.org/)
@@ -15,10 +16,9 @@ control problem with track-corridor safety constraints and solves it online usin
 ## Table of Contents
 
 1. [Overview](#overview)
-2. [Key Features](#key-features)
-3. [Repository Structure](#repository-structure)
-4. [Getting Started](#getting-started)
-5. [Component Reference](#component-reference)
+2. [Repository Structure](#repository-structure)
+3. [Getting Started](#getting-started)
+4. [Component Reference](#component-reference)
    - [mpc_config — Hyperparameter Dataclass](#mpc_config--hyperparameter-dataclass)
    - [State — Vehicle State Dataclass](#state--vehicle-state-dataclass)
    - [wrap_angle — Angle Utility](#wrap_angle--angle-utility)
@@ -35,14 +35,9 @@ control problem with track-corridor safety constraints and solves it online usin
      - [_linear_mpc_control](#_linear_mpc_control)
      - [update_yaw](#update_yaw)
    - [GymMPCRunner — Simulation Harness](#gymmprunner--simulation-harness)
-     - [run](#run)
-     - [_setup_render_callbacks](#_setup_render_callbacks)
-     - [_hud_overlay](#_hud_overlay)
-     - [save_mp4](#save_mp4)
-     - [plot_cte](#plot_cte)
-6. [Data Files](#data-files)
-7. [Tuning Guide](#tuning-guide)
-8. [Quick Example](#quick-example)
+5. [Data Files](#data-files)
+6. [Notes](#NOTES)
+7. [Quick Example](#quick-example)
 
 ---
 
@@ -70,25 +65,6 @@ At every MPC interval the controller:
 
 ---
 
-## Key Features
-
-- **Headless / ROS-free** — runs anywhere Python ≥ 3.10 is available.
-- **CasADi symbolic QP** — warm-started IPOPT solver with configurable tolerances
-  (`ipopt.tol`, `ipopt.acceptable_tol`).
-- **Linearised kinematic bicycle model** — analytical `A`, `B`, `C` Jacobians
-  recomputed at each MPC interval for accuracy around the current operating point.
-- **Track-corridor safety constraints** — per-waypoint normal-vector projections
-  enforce a configurable safety buffer (`CORRIDOR_FRACTION`) around the raceline.
-- **Adaptive speed profile** — curve-aware speed planner with entry boost and
-  exit ramp logic.
-- **Rich GL visualisation** — driven trail, MPC predicted horizon, raceline, and
-  left/right track walls rendered directly in the gym's OpenGL pipeline.
-- **HUD overlay** — PIL-based telemetry text (time, speed, steer angle, CTE) burned
-  into every captured frame.
-- **Structured logging** — per-step dictionary log exported as `cte_plot.png` and
-  `mpc_run.mp4`.
-
----
 
 ## Repository Structure
 
@@ -324,12 +300,12 @@ $$\dot x = f(x, u) \approx A x + B u + C$$
 | Matrix | Non-zero entries | Physical meaning |
 |---|---|---|
 | `A[0,2]` | $\Delta t \cos\phi$ | Speed → X displacement |
-| `A[0,3]` | $-\Delta t\, v \sin\phi$ | Yaw → X displacement |
+| `A[0,3]` | $-\Delta t\ * v \sin\phi$ | Yaw → X displacement |
 | `A[1,2]` | $\Delta t \sin\phi$ | Speed → Y displacement |
-| `A[1,3]` | $\Delta t\, v \cos\phi$ | Yaw → Y displacement |
-| `A[3,2]` | $\Delta t \tan\delta / L$ | Speed → yaw rate |
+| `A[1,3]` | $\Delta t\ * v \cos\phi$ | Yaw → Y displacement |
+| `A[3,2]` | $\Delta t * \tan\delta / L$ | Speed → yaw rate |
 | `B[2,0]` | $\Delta t$ | Acceleration → speed |
-| `B[3,1]` | $\Delta t\, v / (L \cos^2\delta)$ | Steering → yaw rate |
+| `B[3,1]` | $\Delta t\* v / (L * \cos^2\delta)$ | Steering → yaw rate |
 
 ---
 
@@ -344,7 +320,7 @@ Integrates the **discrete kinematic bicycle model** one timestep forward:
 $$x \mathrel{+}= v \cos\psi \cdot \Delta t, \quad
   y \mathrel{+}= v \sin\psi \cdot \Delta t$$
 $$\psi \mathrel{+}= \frac{v}{L}\tan\delta \cdot \Delta t, \quad
-  v \leftarrow \text{clip}(v + a\,\Delta t,\ v_\min,\ v_\max)$$
+  v \leftarrow \text{clip}(v + a\ * \Delta t,\ v_\min,\ v_\max)$$
 
 Used inside `_predict_motion` to roll out the warm-start prediction.
 
@@ -445,97 +421,6 @@ pipeline, and all output artefacts.
 
 ---
 
-#### `run`
-
-The main simulation loop.  Key design decisions:
-
-| Design choice | Detail |
-|---|---|
-| **Gym timestep** | `GYM_DT = 0.01 s` (100 Hz physics) |
-| **MPC interval** | `MPC_INTERVAL = DTK / GYM_DT = 20 steps` (5 Hz control) |
-| **Speed command** | Integrated from `oa[0]` each MPC interval; falls back to reference speed until first valid IPOPT solve |
-| **Collision detection** | Monitors `done` dict each step; prints full state and breaks the loop |
-| **Frame capture** | One annotated RGB frame per simulated second (`RENDER_EVERY = 100`) |
-| **Colab preview** | Detects IPython kernel and calls `IPython.display` live |
-| **Console log** | Prints `step, sim_t, x, y, v_obs, v_cmd, steer_deg, CTE` once per simulated second |
-
-Per-step log entry schema:
-
-```python
-{
-    't':         float,   # simulation time (s)
-    'x':         float,   # world X (m)
-    'y':         float,   # world Y (m)
-    'yaw':       float,   # raw (wrapped) yaw from gym (rad)
-    'v':         float,   # observed speed (m/s)
-    'speed_cmd': float,   # commanded speed sent to gym (m/s)
-    'steer':     float,   # commanded steer angle (rad)
-    'cte':       float,   # signed cross-track error (m)
-    'pred_x':    list,    # MPC predicted horizon x coordinates
-    'pred_y':    list,    # MPC predicted horizon y coordinates
-}
-```
-
----
-
-#### `_setup_render_callbacks`
-
-Registers three OpenGL render callbacks with the gym environment via
-`env.unwrapped.add_render_callback`:
-
-| Callback | Colour | Content |
-|---|---|---|
-| `_static_cb` | White / Gold / Orange | Raceline, left wall, right wall, left/right corridor bounds — drawn once |
-| `_driven_cb` | Cyan `(0,207,255)` | Driven path trail — updated every frame |
-| `_pred_cb` | Neon green `(57,255,20)` | MPC predicted horizon — updated every frame |
-
-Static geometry is created on the first callback invocation and never rebuilt.
-Dynamic renderers use the `renderer.update(pts)` API to avoid allocating new GL
-objects every frame.
-
----
-
-#### `_hud_overlay`
-
-```python
-frame = GymMPCRunner._hud_overlay(frame, sim_t, v, steer, cte)
-```
-
-Burns a four-line telemetry HUD onto the top-left corner of an RGB numpy frame
-using PIL `ImageDraw`.  Includes a 1-pixel shadow for legibility on bright
-backgrounds.
-
-| Line | Colour | Example |
-|---|---|---|
-| `t = 12.0 s` | White | simulation time |
-| `v = 3.42 m/s` | Cyan | observed speed |
-| `δ = 8.3°` | Gold | steering angle |
-| `CTE= +0.023 m` | Orange | cross-track error |
-
----
-
-#### `save_mp4`
-
-```python
-runner.save_mp4("mpc_run.mp4", fps=5)
-```
-
-Writes all captured frames (one per simulated second) to an H.264 MP4 using
-`imageio.mimwrite`.  At `fps=5` a 12-minute simulation produces a ~144-frame
-~29-second summary video.
-
----
-
-#### `plot_cte`
-
-```python
-runner.plot_cte("cte_plot.png")
-```
-
-Plots signed cross-track error (m) versus simulation time (s) from `self._log` and
-saves a `(10 × 3)` inch PNG.  Title includes mean and maximum absolute CTE.
-
----
 
 ## Data Files
 
@@ -547,7 +432,7 @@ uniform 3 cm arc-length grid internally.
 
 ### `Spielberg_border_coeffs.csv`
 
-Five-column CSV with header `a,b,c_center,c_left,c_right`.  
+Seven-column CSV with headers `w_tr_right, w_tr_left,a,b,c_center,c_left,c_right`.  
 
 | Column | Meaning |
 |---|---|
@@ -561,7 +446,7 @@ These are produced offline (e.g. by `random_trackgen.py`) and consumed by
 
 ---
 
-## Tuning Guide
+## NOTES
 
 ### Speed
 
@@ -582,16 +467,15 @@ These are produced offline (e.g. by `random_trackgen.py`) and consumed by
 
 ### Safety corridor
 
-Increase `CORRIDOR_FRACTION` (towards 1.0) to widen the safety buffer.  A value of
-0.0 disables corridor constraints (only outer walls enforced).  A value of 1.0
+Increasing `CORRIDOR_FRACTION` to a value of 1.0
 constrains the car to stay on the raceline exactly.
 
 ### Solver performance
 
 | Symptom | Remediation |
 |---|---|
-| Slow solves | Relax `ipopt.tol` / `ipopt.acceptable_tol` |
-| Infeasibility | Widen corridor (`CORRIDOR_FRACTION ↓`), or increase `MAX_ACCEL` |
+| Lack of moving indicator | Prediction horizon needs to dynamically updated |
+| Infeasibility | Corridor control based on width of the car |
 | Oscillation | Increase `Rdk` (control rate weight) |
 
 ---
