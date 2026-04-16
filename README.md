@@ -128,7 +128,9 @@ class mpc_config:
 | `Qfk` | diag(500,500,5,50) | Terminal state-error weight |
 | `MAX_STEER` | ±0.4189 rad | Steering angle limit |
 | `MAX_ACCEL` | 3.0 m/s² | Acceleration limit |
-| `CORRIDOR_FRACTION` | 0.2 | Safety buffer as fraction of half-width |
+| `CORRIDOR_WIDTH` | 0.33 m | Fixed metric safety buffer inset inward from each wall |
+| `NMPC_CTE_THRESHOLD` | `(2.2−0.33)/2` m | \|CTE\| above which NMPC activates |
+| `NMPC_HYSTERESIS` | 5 intervals | MPC intervals NMPC stays active after CTE drops below threshold |
 
 ---
 
@@ -223,13 +225,17 @@ Reads per-waypoint track boundary data from CSV columns
    `np.interp` on fractional indices.
 2. **Computes track wall XY** coordinates by offsetting the raceline along the
    normal vector `(a, b)` by `(c_left − c_center)` and `(c_right − c_center)`.
-3. **Computes corridor bounds** : Scales each half-width by `CORRIDOR_FRACTION` to
-   obtain tighter safety limits that feed the MPC constraints.
+3. **Computes corridor bounds**  insets `CORRIDOR_WIDTH` metres from each wall
+   inward: `tight_cl = c_left − w`, `tight_cr = c_right + w`.  Where the track is
+   narrower than `2w` the limit collapses to the raceline center so the constraint
+   stays feasible and the car follows the trajectory as closely as geometry allows.
 
-Return shape: `(N, 4)` - columns `[a, b, tight_cl, tight_cr]`.
+   The reference trajectory itself is set to the **geometric track center**
+   (midpoint of `c_left` and `c_right`), not the original optimised raceline.
+
+Return shape: `(N, 4)` — columns `[a, b, tight_cl, tight_cr]`.
 
 ---
-
 #### `_linear_mpc_prob_init`
 
 All matrices that change between solves are declared as `ca.Opti.parameter` so IPOPT can be
@@ -367,7 +373,42 @@ oa, odelta = mpc._linear_mpc_control(ref_path, x0)
 ```
 
 Thin wrapper that runs `_predict_motion` on the carry-forward solution first, then
-calls `_linear_mpc_prob_solve`.  This is the single public entry in the control loop.
+calls `_linear_mpc_prob_solve`.  Called only when the LMPC mode is active.
+
+---
+
+#### `mpc_control`
+
+```python
+oa, odelta, mode = mpc.mpc_control(ref_path, x0, cte=cte)
+```
+
+Single switching entry-point called by `GymMPCRunner` every MPC interval.  Selects
+the active solver based on `|CTE|`:
+
+| Condition | Active solver |
+|---|---|
+| `\|CTE\| < NMPC_CTE_THRESHOLD` | **LMPC** — fast linearised QP |
+| `\|CTE\| ≥ NMPC_CTE_THRESHOLD` | **NMPC** activated; hysteresis counter set to `NMPC_HYSTERESIS` |
+| Hysteresis countdown > 0 | Stay on **NMPC** even after CTE drops |
+
+When NMPC is active it runs alone with **no LMPC fallback**.  On an IPOPT failure
+it carries forward its own last debug iterate.  The two solvers maintain separate
+warm-start caches (`_prev_xk`/`_prev_uk` for LMPC, `_prev_xk_nl`/`_prev_uk_nl`
+for NMPC) and never share state.
+
+The NMPC problem enforces the **full nonlinear kinematic bicycle dynamics**
+symbolically in CasADi per horizon step — no A/B/C linearisation:
+
+$$x_{t+1} = x_t + v_t \cos\psi_t \cdot \Delta t, \quad
+  y_{t+1} = y_t + v_t \sin\psi_t \cdot \Delta t$$
+$$v_{t+1} = v_t + a_t \cdot \Delta t, \quad
+  \psi_{t+1} = \psi_t + \frac{v_t}{L}\tan\delta_t \cdot \Delta t$$
+
+Returns `(oa, odelta, mode_str)` where `mode_str` is `'LMPC'` or `'NMPC'`.
+The active mode is shown on the simulation HUD (green = LMPC, magenta = NMPC)
+and logged in `self._log` under the key `'mode'`.
+
 
 ---
 
