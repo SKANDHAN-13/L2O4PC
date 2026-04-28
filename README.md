@@ -1,6 +1,6 @@
 # MPC on F1Tenth Gym
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1RgHlU39CTojtIGw5r1O9V6uC9l_DRx5a?usp=sharing)
+# Colab link : https://colab.research.google.com/drive/1o4PAN2tpz9ZWa4O-H5uf416K8JX4-9r_?usp=sharing
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
 [![CasADi](https://img.shields.io/badge/Solver-CasADi%20%2F%20IPOPT-orange)](https://web.casadi.org/)
 [![F1Tenth Gym](https://img.shields.io/badge/Sim-F1Tenth%20Gym-red)](https://f1tenth.org/)
