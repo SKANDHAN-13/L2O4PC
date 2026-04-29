@@ -23,18 +23,18 @@ import f1tenth_gym
 class mpc_config:
     NXK: int = 4
     NU:  int = 2
-    TK:  int = 10         #2 seconds lookahead at 0.2s timestep
+    TK:  int = 20      # 4 seconds lookahead at 0.2s timestep
 
     #User-defined weights for the MPC cost function (tune these!)
-    Rk:  list = field(default_factory=lambda: np.diag([1.0, 1.0]))
-    Rdk: list = field(default_factory=lambda: np.diag([0.6, 0.6]))
-    Qk:  list = field(default_factory=lambda: np.diag([50.0, 50.0, 5.0, 10.0]))
-    Qfk: list = field(default_factory=lambda: np.diag([500.0, 500.0, 5.0, 50.0]))
+    Rk:  list = field(default_factory=lambda: np.diag([1.2, 6.0]))
+    Rdk: list = field(default_factory=lambda: np.diag([2.0, 320.0]))
+    Qk:  list = field(default_factory=lambda: np.diag([260, 260, 420, 900]))
+    Qfk: list = field(default_factory=lambda: np.diag([1400, 1400, 1400, 4200]))
     #############################################################
 
     N_IND_SEARCH: int   = 20
 
-    DTK:          float = 0.2
+    DTK:          float = 0.05
     dlk:          float = 0.03
     WB:           float = 0.33
 
@@ -51,11 +51,7 @@ class mpc_config:
     # falls back to the actual wall so the car still stays on track.
     CORRIDOR_WIDTH: float = 0.33  # metres
 
-    # MPC switching thresholds
-    # NMPC is activated when |CTE| exceeds NMPC_CTE_THRESHOLD, and stays active
-    # for NMPC_HYSTERESIS MPC intervals after the condition clears.
-    NMPC_CTE_THRESHOLD: float = (2.2-0.33)/2   # metres
-    NMPC_HYSTERESIS:    int   = 5      # MPC-intervals of hysteresis
+   
 
 
 @dataclass
@@ -71,38 +67,57 @@ def wrap_angle(a):
     return np.arctan2(np.sin(a), np.cos(a))
 
 
-def calc_speed_profile(cx, cy, cyaw):
-    ncourse = len(cx)
+def calc_speed_profile(cx, cy, max_speed: float = 5.0, max_accel: float = 3.0, ds: float = 0.03):
+    """
+    Curvature-based speed profile with forward/backward acceleration passes.
 
-    sp = np.full(ncourse, 5.0) # Pre-initialization of speed at all points to 5.0 m/s
-    
-    CURVE_THRESHOLD    = 0.01  # Yaw change threshold for detecting curves
-    
-    CURVE_SPEED        = 2.5   # Reduction in speed at curve points
-    ENTRY_BOOST_SPEED  = 5.0
-    ENTRY_BOOST_COUNT  = 5
-    EXIT_RAMP_COUNT    = 10
+    Step 1 — curvature κ at every waypoint from path geometry (gradient method).
+    Step 2 — map κ → corner speed limit (linear, normalised to 95th-percentile κ).
+    Step 3 — backward pass: enforce braking ramp *into* each slow corner.
+    Step 4 — forward pass:  enforce acceleration ramp *out of* each corner.
 
-    is_curve = np.zeros(ncourse, dtype=bool)
-    for i in range(ncourse):
-        if abs(cyaw[(i + 1) % ncourse] - cyaw[i]) > CURVE_THRESHOLD:
-            is_curve[i] = True                                       # Curve detection based on yaw change
-    
-    for i in range(ncourse):    
-        if is_curve[i]:
-            sp[i] = CURVE_SPEED     
-            continue
-        
-        for k in range(1, ENTRY_BOOST_COUNT + 1):
-            if is_curve[(i + k) % ncourse]:
-                sp[i] = ENTRY_BOOST_SPEED                             #Entry speed is set at 5.0 m/s for ENTRY_BOOST_COUNT points leading into a curve
-                break
-        
-        #Speed drops to CURVE_SPEED, then the speed is linearly interpolated back to 5.0 m/s over EXIT_RAMP_COUNT points after ENTRY_BOOST_COUNT points
-        for k in range(1, EXIT_RAMP_COUNT + 1):                       
-            if is_curve[(i - k) % ncourse]:
-                sp[i] = CURVE_SPEED + (5.0 - CURVE_SPEED) * (k / EXIT_RAMP_COUNT)
-                break
+    Without steps 3 & 4 the reference drops instantaneously at corner entry —
+    the MPC ignores an impossible step-change and the car enters too fast.
+
+    Args:
+        cx, cy     : path x/y arrays (uniformly spaced at ds)
+        max_speed  : straight-line speed cap [m/s]
+        max_accel  : peak longitudinal accel AND decel [m/s²]
+        ds         : waypoint spacing [m], must match config.dlk (default 0.03)
+    """
+    min_speed = max_speed * 0.25  # floor: 25% of max — allows proper corner braking
+
+    # ── Step 1: curvature (gradient method, circular padding) ────────────
+    x_ext = np.concatenate((cx[-2:], cx, cx[:2]))
+    y_ext = np.concatenate((cy[-2:], cy, cy[:2]))
+    dx  = np.gradient(x_ext, edge_order=2)
+    dy  = np.gradient(y_ext, edge_order=2)
+    d2x = np.gradient(dx,    edge_order=2)
+    d2y = np.gradient(dy,    edge_order=2)
+    denom = (dx**2 + dy**2) ** 1.5
+    denom = np.where(denom < 1e-9, 1e-9, denom)
+    kappa = np.abs((dx * d2y - d2x * dy) / denom)[2:-2]
+
+    # ── Step 2: κ → speed (linear map, 95th-percentile normalisation) ────
+    kappa_max = np.percentile(kappa, 95)
+    if kappa_max < 1e-6:
+        return np.full(len(cx), max_speed)
+    t  = np.clip(kappa / kappa_max, 0.0, 1.0)
+    sp = max_speed - t * (max_speed - min_speed)
+    sp = np.clip(sp, min_speed, max_speed)
+
+    # ── Step 3: backward pass — braking ramp INTO slow corners ─────────
+    for i in range(len(sp) - 2, -1, -1):
+        v_can_reach = math.sqrt(sp[(i + 1) % len(sp)] ** 2 + 2.0 * max_accel * ds)
+        sp[i] = min(sp[i], v_can_reach)
+
+    # ── Step 4: forward pass — acceleration ramp OUT of corners ────────
+    for i in range(1, len(sp)):
+        v_can_reach = math.sqrt(sp[i - 1] ** 2 + 2.0 * max_accel * ds)
+        sp[i] = min(sp[i], v_can_reach)
+
+    # Re-enforce floor after passes (can't brake below min_speed)
+    sp = np.clip(sp, min_speed, max_speed)
     return sp
 
 
@@ -114,8 +129,11 @@ class HeadlessMPC:
     Contains every MPC method from mpc_node.py with the ROS calls removed.
     """
 
-    def __init__(self, waypoints_csv: str, border_coeffs_csv: str = None):
+    def __init__(self, waypoints_csv: str, border_coeffs_csv: str = None,
+                 max_speed: float = None):
         self.config  = mpc_config()
+        if max_speed is not None:
+            self.config.MAX_SPEED = max_speed  # must be set before _linear_mpc_prob_init bakes it
         self.oa      = None
         self.odelta_v = None
         self.odelta   = None
@@ -129,9 +147,8 @@ class HeadlessMPC:
 
         self.waypoints = self._load_waypoints(waypoints_csv)         # An array of {x, y, yaw} from the waypoints.csv file
 
-        # Switching state
-        self._active_mode      = 'NMPC'   # 'LMPC' or 'NMPC'
-        self._nmpc_hyst_count  = 0        # countdown hysteresis intervals
+        # Active mode flag
+        self._active_mode = 'LMPC'   # 'LMPC' or 'NMPC'
         # Separate warm-start cache for each solver
         self._prev_xk_nl = None
         self._prev_uk_nl = None
@@ -140,11 +157,18 @@ class HeadlessMPC:
             self.border_coeffs = self._load_border_coeffs(border_coeffs_csv)  # An array of {w_r, w_l,a, b, tight_cl, tight_cr} is loaded to use as constraints on the border of the race-track.
             self._has_border = True
             print(f" Border constraints loaded: {self.border_coeffs.shape[0]} rows ")
-            # Replace raceline x/y with geometric track-center so MPC tracks the
-            # midpoint between the two walls instead of the optimised racing line.
-            self.waypoints[:, 0] = self.track_center_xy[:, 0]
-            self.waypoints[:, 1] = self.track_center_xy[:, 1]
-            print(" Waypoints replaced with track-center coordinates.")
+            # Replace raceline x/y/yaw with geometric track-center so MPC tracks
+            # the midpoint between the two walls instead of the optimised racing line.
+            _cx = self.track_center_xy[:, 0]
+            _cy = self.track_center_xy[:, 1]
+            self.waypoints[:, 0] = _cx
+            self.waypoints[:, 1] = _cy
+            # Recompute yaw from the centerline tangent so ref_yaw matches the
+            # actual direction of travel along the center — not the original raceline.
+            _dx = np.gradient(_cx)
+            _dy = np.gradient(_cy)
+            self.waypoints[:, 2] = np.unwrap(np.arctan2(_dy, _dx))
+            print(" Waypoints (x, y, yaw) replaced with track-center coordinates.")
        
         else:
             self.border_coeffs = None
@@ -195,7 +219,6 @@ class HeadlessMPC:
     ####################################################################################
 
     def _load_border_coeffs(self, path: str) -> np.ndarray:
-        
         data = []
 
         with open(path, 'r') as f:
@@ -291,6 +314,7 @@ class HeadlessMPC:
         obj   = (ca.mtimes([u_vec.T, R_block, u_vec])
                + ca.mtimes([x_err.T, Q_block, x_err])
                + ca.mtimes([du.T, Rd_block, du]))
+        self._lmpc_obj = obj   # keep reference for cost logging
         self.opti.minimize(obj)
 
         # Linearized dynamics constraints
@@ -310,12 +334,13 @@ class HeadlessMPC:
             <= self.config.MAX_DSTEER * self.config.DTK
         )
         self.opti.subject_to(self.xk[:, 0] == self.x0k)
+        self.max_speed_param = self.opti.parameter(1)
         self.opti.subject_to(self.xk[2, :] >= self.config.MIN_SPEED)
-        self.opti.subject_to(self.xk[2, :] <= self.config.MAX_SPEED)
+        self.opti.subject_to(self.xk[2, :] <= self.max_speed_param)
         self.opti.subject_to(ca.fabs(self.uk[0, :]) <= self.config.MAX_ACCEL)
         self.opti.subject_to(ca.fabs(self.uk[1, :]) <= self.config.MAX_STEER)
 
-        # Track-corridor linear constraints
+        # Hard corridor wall constraints
         if self._has_border:
             # Per horizon step
             self.border_a_k  = self.opti.parameter(T + 1)   # normal-x component
@@ -333,12 +358,12 @@ class HeadlessMPC:
         self.opti.solver('ipopt', {
             'ipopt.print_level': 0, 'print_time': 0,
             'ipopt.max_iter': 200,    
-            'ipopt.tol': 1e-2,
+            'ipopt.tol': 1e-3,
             'ipopt.acceptable_tol': 5e-2,
-            'ipopt.acceptable_iter': 3,
+            'ipopt.acceptable_iter': 5,
             'ipopt.warm_start_init_point': 'yes',
             'ipopt.warm_start_bound_push': 1e-6,
-            'ipopt.warm_start_mult_bound_push': 1e-6,
+            'ipopt.max_cpu_time': 0.15,
         })
 
     #####################################################################
@@ -417,8 +442,12 @@ class HeadlessMPC:
             self.target_ind = search_indices[local_best]
         ind   = self.target_ind
 
-        # Distance covered per MPC timestep at current speed (floor 0.5 m/s at startup)
-        travel = max(state.v, 0.5) * self.config.DTK
+        # Distance covered per MPC timestep at current speed.
+        # Floor at 50% of MAX_SPEED (same as mpc_node.py) so the horizon always
+        # extends far enough even from a standstill — 0.5 m/s floor caused the
+        # reference to cover only ~1 m total at startup, giving the MPC no useful
+        # lookahead and producing junk steering commands.
+        travel = max(state.v, self.config.MAX_SPEED * 0.5) * self.config.DTK
         dind   = travel / self.config.dlk
         ind_list = (int(ind) + np.insert(
             np.cumsum(np.repeat(dind, self.config.TK)), 0, 0
@@ -433,6 +462,7 @@ class HeadlessMPC:
 
     ################################################################
     def _linear_mpc_prob_solve(self, ref_traj, path_predict, x0):
+        self.opti.set_value(self.max_speed_param, self.config.MAX_SPEED)
         self.opti.set_value(self.x0k, x0)
         NX, NU, T = self.config.NXK, self.config.NU, self.config.TK
         A_bd = np.zeros((NX * T, NX * T))
@@ -478,28 +508,49 @@ class HeadlessMPC:
             self.opti.set_initial(self.xk, ref_traj)
             self.opti.set_initial(self.uk, np.zeros((NU, T)))
 
+        cost = float('nan')
         try:
             sol    = self.opti.solve()
             oa     = np.array(sol.value(self.uk[0, :])).flatten()
             odelta = np.array(sol.value(self.uk[1, :])).flatten()
             self._prev_xk = np.array(sol.value(self.xk))
             self._prev_uk = np.array(sol.value(self.uk))
+            cost   = float(sol.value(self._lmpc_obj))
         except Exception as e:
             try:
                 oa     = np.array(self.opti.debug.value(self.uk[0, :])).flatten()
                 odelta = np.array(self.opti.debug.value(self.uk[1, :])).flatten()
                 self._prev_xk = np.array(self.opti.debug.value(self.xk))
                 self._prev_uk = np.array(self.opti.debug.value(self.uk))
+                cost   = float(self.opti.debug.value(self._lmpc_obj))
             except Exception:
                 pass   # carry-forward oa/odelta already set above
-        return oa, odelta
+        return oa, odelta, cost
 
     ##########################################################################
     def _linear_mpc_control(self, ref_path, x0):
         oa = self.oa       if self.oa       is not None else [0.0]*self.config.TK
         od = self.odelta_v if self.odelta_v is not None else [0.0]*self.config.TK
-        path_predict = self._predict_motion(x0, oa, od, ref_path)
-        return self._linear_mpc_prob_solve(ref_path, path_predict, x0)
+
+        # Use the previous optimal trajectory as the linearization point when
+        # available — it stays on the reference path and gives IPOPT an accurate
+        # local model, preventing corner-cut exploitation of linearization error.
+        # Fall back to _predict_motion on the very first call (no prior solution).
+        if self._prev_xk is not None and self._prev_uk is not None:
+            # Shift the cached solution one step forward as the new operating point
+            NX, NU, T = self.config.NXK, self.config.NU, self.config.TK
+            path_predict = np.zeros((NX, T + 1))
+            path_predict[:, :-1] = self._prev_xk[:, 1:]
+            path_predict[:, -1]  = self._prev_xk[:, -1]
+            # Keep x0 anchored to current state
+            path_predict[:, 0] = x0
+        else:
+            x0_pred = list(x0)
+            if abs(x0_pred[2]) < 0.5:
+                x0_pred[2] = float(ref_path[2, 1])   # seed ref velocity at standstill
+            path_predict = self._predict_motion(x0_pred, oa, od, ref_path)
+
+        return self._linear_mpc_prob_solve(ref_path, path_predict, x0)  # (oa, odelta, cost)
 
     ##########################################################################
     def _nonlinear_mpc_prob_init(self):
@@ -525,6 +576,7 @@ class HeadlessMPC:
         obj   = (ca.mtimes([u_vec.T, R_block, u_vec])
                + ca.mtimes([x_err.T, Q_block, x_err])
                + ca.mtimes([du.T,    Rd_block, du]))
+        self._nmpc_obj = obj   # keep reference for cost logging
         self.opti_nl.minimize(obj)
 
         # Nonlinear kinematic bicycle dynamics (Euler, DTK step)
@@ -552,28 +604,30 @@ class HeadlessMPC:
         self.opti_nl.subject_to(
             ca.fabs(self.uk_nl[1, 1:] - self.uk_nl[1, :-1])
             <= self.config.MAX_DSTEER * self.config.DTK)
+        self.max_speed_param_nl = self.opti_nl.parameter(1)
         self.opti_nl.subject_to(self.xk_nl[2, :] >= self.config.MIN_SPEED)
-        self.opti_nl.subject_to(self.xk_nl[2, :] <= self.config.MAX_SPEED)
+        self.opti_nl.subject_to(self.xk_nl[2, :] <= self.max_speed_param_nl)
         self.opti_nl.subject_to(ca.fabs(self.uk_nl[0, :]) <= self.config.MAX_ACCEL)
         self.opti_nl.subject_to(ca.fabs(self.uk_nl[1, :]) <= self.config.MAX_STEER)
 
-        # Track-corridor constraints 
+        # Corridor wall constraints (same as LMPC)
         if self._has_border:
-            self.border_a_nl  = self.opti_nl.parameter(T + 1)
-            self.border_b_nl  = self.opti_nl.parameter(T + 1)
-            self.border_cl_nl = self.opti_nl.parameter(T + 1)
-            self.border_cr_nl = self.opti_nl.parameter(T + 1)
-            proj_nl = (self.border_a_nl * ca.vec(self.xk_nl[0, :])
-                     + self.border_b_nl * ca.vec(self.xk_nl[1, :]))
-            self.opti_nl.subject_to(proj_nl <= self.border_cl_nl)
-            self.opti_nl.subject_to(proj_nl >= self.border_cr_nl)
+            self.border_a_k_nl  = self.opti_nl.parameter(T + 1)
+            self.border_b_k_nl  = self.opti_nl.parameter(T + 1)
+            self.border_cl_k_nl = self.opti_nl.parameter(T + 1)
+            self.border_cr_k_nl = self.opti_nl.parameter(T + 1)
+            proj_nl = (self.border_a_k_nl * ca.vec(self.xk_nl[0, :])
+                     + self.border_b_k_nl * ca.vec(self.xk_nl[1, :]))
+            self.opti_nl.subject_to(proj_nl <= self.border_cl_k_nl)
+            self.opti_nl.subject_to(proj_nl >= self.border_cr_k_nl)
 
         self.opti_nl.solver('ipopt', {
             'ipopt.print_level': 0, 'print_time': 0,
-            'ipopt.max_iter': 300,
-            'ipopt.tol': 1e-2,
-            'ipopt.acceptable_tol': 5e-2,
-            'ipopt.acceptable_iter': 3,
+            'ipopt.max_iter': 200,
+            'ipopt.tol': 1e-3,
+            'ipopt.acceptable_tol': 1e-2,
+            'ipopt.acceptable_iter': 5,
+            'ipopt.max_cpu_time': 0.15,
             'ipopt.warm_start_init_point': 'yes',
             'ipopt.warm_start_bound_push': 1e-6,
             'ipopt.warm_start_mult_bound_push': 1e-6,
@@ -581,24 +635,26 @@ class HeadlessMPC:
 
     ##########################################################################
     def _nonlinear_mpc_prob_solve(self, ref_traj, x0):
-        
+        self.opti_nl.set_value(self.max_speed_param_nl, self.config.MAX_SPEED)
         self.opti_nl.set_value(self.x0k_nl, x0)
 
-        if self._has_border and self._last_ind_list is not None:
-            bc = self.border_coeffs[self._last_ind_list]
-            self.opti_nl.set_value(self.border_a_nl,  bc[:, 0])
-            self.opti_nl.set_value(self.border_b_nl,  bc[:, 1])
-            self.opti_nl.set_value(self.border_cl_nl, bc[:, 2])
-            self.opti_nl.set_value(self.border_cr_nl, bc[:, 3])
-
-        # Yaw continuity
+        # Yaw continuity: sequential unwrap only — no bulk wrap_angle pass.
+        # wrap_angle on the full array maps all horizon yaws to within [-π,π]
+        # of x0[3], which breaks sequencing on sustained turns > π total.
         ref_traj = ref_traj.copy()
-        ref_traj[3, :] = x0[3] + wrap_angle(ref_traj[3, :] - x0[3])
+        ref_traj[3, 0] = x0[3] + wrap_angle(ref_traj[3, 0] - x0[3])
         for i in range(1, ref_traj.shape[1]):
             d = ref_traj[3, i] - ref_traj[3, i - 1]
             if d >  np.pi: ref_traj[3, i] -= 2 * np.pi
             if d < -np.pi: ref_traj[3, i] += 2 * np.pi
         self.opti_nl.set_value(self.ref_traj_nl, ref_traj)
+
+        if self._has_border and self._last_ind_list is not None:
+            bc = self.border_coeffs[self._last_ind_list]   # (T+1, 4)
+            self.opti_nl.set_value(self.border_a_k_nl,  bc[:, 0])
+            self.opti_nl.set_value(self.border_b_k_nl,  bc[:, 1])
+            self.opti_nl.set_value(self.border_cl_k_nl, bc[:, 2])
+            self.opti_nl.set_value(self.border_cr_k_nl, bc[:, 3])
 
         NX, NU, T = self.config.NXK, self.config.NU, self.config.TK
 
@@ -617,45 +673,41 @@ class HeadlessMPC:
 
         oa     = self.oa       if self.oa       is not None else np.zeros(T)
         odelta = self.odelta_v if self.odelta_v is not None else np.zeros(T)
+        cost   = float('nan')
         try:
             sol    = self.opti_nl.solve()
             oa     = np.array(sol.value(self.uk_nl[0, :])).flatten()
             odelta = np.array(sol.value(self.uk_nl[1, :])).flatten()
             self._prev_xk_nl = np.array(sol.value(self.xk_nl))
             self._prev_uk_nl = np.array(sol.value(self.uk_nl))
+            cost   = float(sol.value(self._nmpc_obj))
         except Exception:
             try:
                 oa     = np.array(self.opti_nl.debug.value(self.uk_nl[0, :])).flatten()
                 odelta = np.array(self.opti_nl.debug.value(self.uk_nl[1, :])).flatten()
                 self._prev_xk_nl = np.array(self.opti_nl.debug.value(self.xk_nl))
                 self._prev_uk_nl = np.array(self.opti_nl.debug.value(self.uk_nl))
+                cost   = float(self.opti_nl.debug.value(self._nmpc_obj))
             except Exception:
-                pass  
-        return oa, odelta
+                pass
+        return oa, odelta, cost
 
     ##########################################################################
     def _nonlinear_mpc_control(self, ref_path, x0):
-        return self._nonlinear_mpc_prob_solve(ref_path, x0)
+        return self._nonlinear_mpc_prob_solve(ref_path, x0)  # (oa, odelta, cost)
 
     ##########################################################################
-    def mpc_control(self, ref_path, x0, cte: float = 0.0):
-        
-        cfg = self.config
-        if abs(cte) >= cfg.NMPC_CTE_THRESHOLD:
-            self._nmpc_hyst_count = cfg.NMPC_HYSTERESIS
+    def mpc_control(self, ref_path, x0):
+        mode = getattr(self, '_fixed_mode', None) or 'LMPC'
 
-        use_nmpc = self._nmpc_hyst_count > 0
-        if use_nmpc:
-            self._nmpc_hyst_count = max(0, self._nmpc_hyst_count - 1)
-
-        if use_nmpc:
-            oa, odelta = self._nonlinear_mpc_control(ref_path, x0)
+        if mode == 'NMPC':
+            oa, odelta, cost = self._nonlinear_mpc_control(ref_path, x0)
             self._active_mode = 'NMPC'
         else:
-            oa, odelta = self._linear_mpc_control(ref_path, x0)
+            oa, odelta, cost = self._linear_mpc_control(ref_path, x0)
             self._active_mode = 'LMPC'
 
-        return oa, odelta, self._active_mode
+        return oa, odelta, self._active_mode, cost
 
     #########################################################################
     def update_yaw(self, yaw_raw: float) -> float:
@@ -673,8 +725,9 @@ class HeadlessMPC:
 class GymMPCRunner:
     
     def __init__(self, waypoints_csv: str, map_name: str = "Spielberg",
-                 border_coeffs_csv: str = None):
-        self.mpc      = HeadlessMPC(waypoints_csv, border_coeffs_csv=border_coeffs_csv)
+                 border_coeffs_csv: str = None, max_speed: float = None):
+        self.mpc      = HeadlessMPC(waypoints_csv, border_coeffs_csv=border_coeffs_csv,
+                                    max_speed=max_speed)
         self.map_name = map_name
         self._log: list    = []   # list of dicts, one per control step
         self._frames: list = []   # annotated RGB frames
@@ -684,9 +737,6 @@ class GymMPCRunner:
         self._pred_state   = {'renderer': None, 'points': np.zeros((1, 2), dtype=np.float32)}
 
     def run(self,
-            start_x: float = 0.0,
-            start_y: float = 0.0,
-            start_theta: float = 0.0,
             max_sim_seconds: float = 60.0):
 
         import gymnasium as gym
@@ -718,15 +768,15 @@ class GymMPCRunner:
             render_mode="rgb_array",
         )
 
-        try:
-            track = env.unwrapped.track
-            poses = np.array([[
-                track.raceline.xs[0],
-                track.raceline.ys[0],
-                track.raceline.yaws[0],
-            ]])
-        except Exception:
-            poses = np.array([[start_x, start_y, start_theta]])
+        # Spawn at waypoints[0]: this is the track-center coordinate when
+        # border_coeffs are loaded (waypoints replaced in __init__), otherwise
+        # the raceline start.  Wrap yaw to [-pi, pi] — gym requires it.
+        _spawn_x   = float(self.mpc.waypoints[0, 0])
+        _spawn_y   = float(self.mpc.waypoints[0, 1])
+        _spawn_yaw = float(wrap_angle(self.mpc.waypoints[0, 2]))
+        print(f"Spawn pose → x={_spawn_x:.3f}  y={_spawn_y:.3f}  "
+              f"yaw={math.degrees(_spawn_yaw):.1f}°")
+        poses = np.array([[_spawn_x, _spawn_y, _spawn_yaw]])
         obs, info = env.reset(options={"poses": poses})
 
 
@@ -740,7 +790,8 @@ class GymMPCRunner:
         ref_x    = self.mpc.waypoints[:, 0]
         ref_y    = self.mpc.waypoints[:, 1]
         ref_yaw  = self.mpc.waypoints[:, 2]
-        ref_v    = calc_speed_profile(ref_x, ref_y, ref_yaw)
+        ref_v    = calc_speed_profile(ref_x, ref_y, cfg.MAX_SPEED,
+                                        max_accel=cfg.MAX_ACCEL, ds=cfg.dlk)
 
       
         GYM_DT        = 0.01
@@ -751,8 +802,7 @@ class GymMPCRunner:
         # Seeded from the reference profile so the car moves before the first
         # successful IPOPT solve; thereafter updated by MPC acceleration output.
 
-        speed_desired = float(ref_v[0])
-        mpc_valid     = False          # True once we have a real IPOPT solution
+        speed_desired = 0.0   # start from rest; ramp up via ref-profile rate limiter
         ref_path      = None           # persisted across MPC intervals
         sim_time      = 0.0
         step_count    = 0
@@ -764,6 +814,7 @@ class GymMPCRunner:
 
         pred_horizon_x: list = []   # MPC horizon x
         pred_horizon_y: list = []   # MPC horizon y
+        _cost: float = float('nan') # latest solver objective value
 
         # Live per-second snapshot display
         try:
@@ -802,17 +853,16 @@ class GymMPCRunner:
                         vehicle_state, ref_x, ref_y, ref_yaw, ref_v
                     )
                     x0 = [vehicle_state.x, vehicle_state.y, vehicle_state.v, vehicle_state.yaw]
-                    # Signed CTE at this moment (recomputed before the solve for switching)
-                    _ind = self.mpc.target_ind
-                    _cte_sw = (-(vehicle_state.x - ref_x[_ind]) * math.sin(ref_yaw[_ind])
-                               + (vehicle_state.y - ref_y[_ind]) * math.cos(ref_yaw[_ind]))
-                    self.mpc.oa, self.mpc.odelta_v, _mode = self.mpc.mpc_control(
-                        ref_path, x0, cte=_cte_sw)
+                    self.mpc.oa, self.mpc.odelta_v, _mode, _cost = self.mpc.mpc_control(
+                        ref_path, x0)
 
                     # Cache predicted horizon for visualisation
-                    if self.mpc._prev_xk is not None:
-                        pred_horizon_x = self.mpc._prev_xk[0, :].tolist()
-                        pred_horizon_y = self.mpc._prev_xk[1, :].tolist()
+                    # Use the correct cache depending on which solver just ran.
+                    _xk_cache = (self.mpc._prev_xk_nl if _mode == 'NMPC'
+                                 else self.mpc._prev_xk)
+                    if _xk_cache is not None:
+                        pred_horizon_x = _xk_cache[0, :].tolist()
+                        pred_horizon_y = _xk_cache[1, :].tolist()
 
                     # Steering: from MPC odelta_v[0]
                     if self.mpc.odelta_v is not None:
@@ -820,29 +870,22 @@ class GymMPCRunner:
                                               cfg.MIN_STEER, cfg.MAX_STEER))
 
                     
-                    # Speed: integrate MPC acceleration into a desired velocity.
-                    # The gym KS model tracks a target velocity — so we maintain
-                    # speed_desired and update it with oa[0] each MPC interval.
-                    # On a failed solve (oa all-zero first time) we fall back to
-                    # the reference speed profile to keep the car moving.
-                    if self.mpc.oa is not None and mpc_valid:
-                        speed_desired = float(np.clip(
-                            v + self.mpc.oa[0] * cfg.DTK,
-                            cfg.MIN_SPEED, cfg.MAX_SPEED))
-                        mpc_valid = True
-                    else:
-                        # Reference speed at the current look-ahead point
-                        speed_desired = float(np.clip(
-                            ref_path[2, 1], cfg.MIN_SPEED, cfg.MAX_SPEED))
-                        # Promote to MPC-driven once oa is non-trivial
-                        if (self.mpc.oa is not None
-                                and np.any(np.abs(self.mpc.oa) > 1e-3)):
-                            mpc_valid = True
+                    # Speed: use reference profile as feedforward, clamped by MPC accel limit.
+                    # Do NOT use oa[0] integration — with high position weights the MPC
+                    # freely commands negative acceleration to stay on path, self-locking
+                    # the car at low speed.  The reference profile already encodes braking
+                    # ramps; we just follow it directly and let the gym's velocity controller
+                    # handle the actual longitudinal dynamics.
+                    _ref_v_now = float(ref_v[self.mpc.target_ind])
+                    step_size  = cfg.MAX_ACCEL * cfg.DTK
+                    speed_desired = float(np.clip(
+                        speed_desired + np.sign(_ref_v_now - speed_desired) * step_size,
+                        cfg.MIN_SPEED, cfg.MAX_SPEED))
 
                 # Signed CTE
                 ind  = self.mpc.target_ind
                 cx_  = ref_x[ind]; cy_ = ref_y[ind]; cy_yaw = ref_yaw[ind]
-                cte  = (-(vehicle_state.x - cx_) * math.sin(cy_yaw)
+                cte  = abs(-(vehicle_state.x - cx_) * math.sin(cy_yaw)
                         + (vehicle_state.y - cy_) * math.cos(cy_yaw))
                 self._log.append({
                     't':        sim_time,
@@ -854,6 +897,7 @@ class GymMPCRunner:
                     'steer':    steer,
                     'cte':      cte,
                     'mode':     self.mpc._active_mode,
+                    'cost':     _cost if step_count % MPC_INTERVAL == 0 else float('nan'),
                     'pred_x':   list(pred_horizon_x),
                     'pred_y':   list(pred_horizon_y),
                 })
@@ -912,13 +956,20 @@ class GymMPCRunner:
         except KeyboardInterrupt:
             print(f"\n[INTERRUPTED] step={step_count}  sim_t={sim_time:.3f}s  "
                   f"frames={len(self._frames)}  log-entries={len(self._log)}")
-            print("Saving captured frames before exit ...")
-
-        env.close()
-        wall = time.time() - t_wall_start
-        collided_str = "  COLLISION" if (any(done.values()) if isinstance(done, dict) else bool(done)) else ""
-        print(f"Simulation finished.  sim-time={sim_time:.2f}s  wall-time={wall:.1f}s  "
-              f"steps={step_count}  log-entries={len(self._log)}{collided_str}")
+            print("Saving plots and frames before exit ...")
+        finally:
+            # Always runs: on normal finish, collision, or KeyboardInterrupt.
+            # Generates plots here so they are saved even if the cell is stopped.
+            env.close()
+            wall = time.time() - t_wall_start
+            try:
+                collided_str = "  COLLISION" if (any(done.values()) if isinstance(done, dict) else bool(done)) else ""
+            except Exception:
+                collided_str = ""
+            print(f"Simulation finished.  sim-time={sim_time:.2f}s  wall-time={wall:.1f}s  "
+                  f"steps={step_count}  log-entries={len(self._log)}{collided_str}")
+            self.plot_cte("cte_plot.png")
+            self.plot_cost("cost_plot.png")
 
     #####################################################################################
     def _setup_render_callbacks(self, env):
@@ -974,9 +1025,10 @@ class GymMPCRunner:
             else:
                 runner._driven_state['renderer'].update(pts)
 
-        # MPC predicted horizon 
+        # MPC predicted horizon
         def _pred_cb(er):
-            xk = runner.mpc._prev_xk
+            xk = (runner.mpc._prev_xk_nl if runner.mpc._active_mode == 'NMPC'
+                  else runner.mpc._prev_xk)
             if xk is None:
                 return
             pts = np.column_stack([xk[0, :], xk[1, :]]).astype(np.float32)
@@ -999,14 +1051,11 @@ class GymMPCRunner:
         from PIL import Image, ImageDraw
         img  = Image.fromarray(frame)
         draw = ImageDraw.Draw(img)
-        mode     = kwargs.get('mode', 'LMPC')
-        mode_col = (57, 255, 20) if mode == 'LMPC' else (255, 80, 200)
         lines = [
             (f"t  = {sim_t:.1f} s",      (255, 255, 255)),
             (f"v  = {v:.2f} m/s",        (0,   207, 255)),
             (f"\u03b4  = {math.degrees(steer):.1f}\u00b0", (255, 215,   0)),
             (f"CTE= {cte:+.3f} m",       (255, 107,  53)),
-            (f"MPC= {mode}",             mode_col),
         ]
         x0, y0, dy = 10, 10, 18
         for i, (text, colour) in enumerate(lines):
@@ -1023,9 +1072,43 @@ class GymMPCRunner:
         
         import imageio
         print(f"Writing {len(self._frames)} annotated frames → {out_path} ...")
-        imageio.mimwrite(out_path, self._frames, fps=fps, quality=8)
+        imageio.mimwrite(out_path, self._frames, fps=fps)
         size_mb = os.path.getsize(out_path) / 1e6
         print(f"Saved: {out_path}  ({size_mb:.1f} MB)")
+
+    #########################################################################
+    def plot_cost(self, out_path: str = "cost_plot.png"):
+        if not self._log:
+            print("No log data."); return
+
+        ts    = [e['t']    for e in self._log]
+        costs = [e['cost'] for e in self._log]
+        modes = [e['mode'] for e in self._log]
+
+        # Separate by solver so they can be coloured differently
+        t_lmpc = [t for t, c, m in zip(ts, costs, modes) if m == 'LMPC' and not math.isnan(c)]
+        c_lmpc = [c for t, c, m in zip(ts, costs, modes) if m == 'LMPC' and not math.isnan(c)]
+        t_nmpc = [t for t, c, m in zip(ts, costs, modes) if m == 'NMPC' and not math.isnan(c)]
+        c_nmpc = [c for t, c, m in zip(ts, costs, modes) if m == 'NMPC' and not math.isnan(c)]
+
+        fig, ax = plt.subplots(figsize=(10, 3))
+        if t_lmpc:
+            k=[]
+            ax.scatter(t_lmpc, c_lmpc, s=4, color='#00cfff', label='LMPC', zorder=3)
+            k.append(c_lmpc)
+        if t_nmpc:
+            k=[]
+            ax.scatter(t_nmpc, c_nmpc, s=4, color='#ff6b35', label='NMPC', zorder=3)
+            k.append(c_nmpc)
+        ax.set_xlabel('sim time [s]')
+        ax.set_ylabel('Objective cost')
+        ax.set_title(f'MPC Optimization Cost per Solve (mean={np.mean(costs):.4f}, max={np.max(costs):.4f})')
+        ax.legend()
+        ax.grid(alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=150)
+        plt.close(fig)
+        print(f"Cost plot saved: {out_path}")
 
     #########################################################################
     def plot_cte(self, out_path: str = "cte_plot.png"):
@@ -1047,35 +1130,73 @@ class GymMPCRunner:
 
 
 ###################################################################################################################
-def colab_main():
-    
-    print("Starting final Constrained-MPC runner in Colab ...")
-    # Files should be in the same directory as the notebook
+def colab_main(
+    max_speed:         float = 5.0,
+    solver_mode:       str   = 'AUTO',   # 'LMPC' | 'NMPC' | 'AUTO'
+    max_sim_seconds:   float = 60.0 * 12,
+    waypoints_csv:     str   = "waypoints.csv",
+    border_coeffs_csv: str   = "Spielberg_border_coeffs.csv",
+    map_name:          str   = "Spielberg",
+):
+    """
+    Entry point for Colab.  All parameters can be passed from the notebook cell:
+
+        from mpc_gym_colab import colab_main
+        colab_main(max_speed=7.0, solver_mode='NMPC', max_sim_seconds=300)
+    """
+    solver_mode = solver_mode.upper()
+    assert solver_mode in ('LMPC', 'NMPC', 'AUTO'), \
+        "solver_mode must be 'LMPC', 'NMPC', or 'AUTO'"
+
+    print(f"Configuration → MAX_SPEED={max_speed} m/s  |  solver_mode={solver_mode}  |"
+          f"  sim={max_sim_seconds:.0f}s")
+    print("Starting Constrained-MPC runner ...")
+
+    # Start a virtual display for headless OpenGL rendering (required in Colab)
+    try:
+        from pyvirtualdisplay import Display
+        _display = Display(visible=False, size=(1400, 900))
+        _display.start()
+        print("Virtual display started.")
+    except Exception as e:
+        print(f"[WARN] pyvirtualdisplay not available: {e} — proceeding without virtual display")
+
     runner = GymMPCRunner(
-        waypoints_csv     = "waypoints.csv",
-        map_name          = "Spielberg",            
-        border_coeffs_csv = "Spielberg_border_coeffs.csv",
+        waypoints_csv     = waypoints_csv,
+        map_name          = map_name,
+        border_coeffs_csv = border_coeffs_csv,
+        max_speed         = max_speed,
     )
+    # Pin the solver: 'LMPC', 'NMPC', or None (defaults to LMPC, no switching)
+    runner.mpc._fixed_mode = solver_mode if solver_mode in ('LMPC', 'NMPC') else None
+
     try:
         runner.run(
-            start_x      = 0.0,
-            start_y      = 0.0,
-            start_theta  = 0.0,
-            max_sim_seconds = 60.0*12,  # 12 minutes sim-time max
+            max_sim_seconds = max_sim_seconds,
         )
     finally:
-        # 1 frame/s captured → play at 5 fps = 5× speed summary
         runner.save_mp4("mpc_run.mp4", fps=5)
-        runner.plot_cte("cte_plot.png")
-
+        # cte_plot.png and cost_plot.png are already saved inside run()'s finally.
+        # Each display is in its own try/except so a failed video export
+        # does not prevent the CTE and cost plots from being shown.
         try:
             from IPython.display import display, Video, Image
             print("\n=== Final video ===")
             display(Video("mpc_run.mp4", embed=True, width=800))
+        except Exception:
+            pass
+        try:
+            from IPython.display import display, Image
             print("\n=== CTE plot ===")
             display(Image("cte_plot.png"))
         except Exception:
-            pass   
+            pass
+        try:
+            from IPython.display import display, Image
+            print("\n=== Optimization cost plot ===")
+            display(Image("cost_plot.png"))
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
